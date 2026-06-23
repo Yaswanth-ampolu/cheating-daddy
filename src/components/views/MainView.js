@@ -354,6 +354,11 @@ export class MainView extends LitElement {
             background: var(--bg-hover);
         }
 
+        .mode-card.active {
+            border-color: var(--accent);
+            background: rgba(59, 130, 246, 0.1);
+        }
+
         .mode-card-title {
             font-size: var(--font-size-sm);
             font-weight: var(--font-weight-semibold);
@@ -572,7 +577,6 @@ export class MainView extends LitElement {
             }
 
             // Load keys
-            this._hostedProvider = prefs.hostedProvider || 'gemini';
             this._token = creds.cloudToken || '';
             this._geminiKey = (await cheatingDaddy.storage.getApiKey().catch(() => '')) || '';
             this._groqKey = (await cheatingDaddy.storage.getGroqApiKey().catch(() => '')) || '';
@@ -585,6 +589,16 @@ export class MainView extends LitElement {
             this._ollamaHost = prefs.ollamaHost || 'http://127.0.0.1:11434';
             this._ollamaModel = prefs.ollamaModel || 'llama3.1';
             this._whisperModel = prefs.whisperModel || 'Xenova/whisper-small';
+
+            const hasAzureConfig = this._azureResourceOrEndpoint.trim() && this._azureApiKey.trim();
+            const hasGeminiConfig = this._geminiKey.trim();
+
+            if (!hasGeminiConfig && hasAzureConfig) {
+                this._hostedProvider = 'azure';
+                await cheatingDaddy.storage.updatePreference('hostedProvider', 'azure');
+            } else {
+                this._hostedProvider = prefs.hostedProvider || 'gemini';
+            }
 
             this.requestUpdate();
         } catch (e) {
@@ -760,6 +774,10 @@ export class MainView extends LitElement {
         this._azureResourceOrEndpoint = val;
         this._keyError = false;
         await cheatingDaddy.storage.updatePreference('azureResourceOrEndpoint', val);
+        if (val.trim() && this._azureApiKey.trim() && !this._geminiKey.trim()) {
+            await this._saveHostedProvider('azure');
+            return;
+        }
         this.requestUpdate();
     }
 
@@ -767,6 +785,10 @@ export class MainView extends LitElement {
         this._azureApiKey = val;
         this._keyError = false;
         await cheatingDaddy.storage.setAzureApiKey(val);
+        if (val.trim() && this._azureResourceOrEndpoint.trim() && !this._geminiKey.trim()) {
+            await this._saveHostedProvider('azure');
+            return;
+        }
         this.requestUpdate();
     }
 
@@ -812,8 +834,11 @@ export class MainView extends LitElement {
     _handleStart() {
         if (this.isInitializing) return;
 
+        const shouldUseAzureFallback =
+            this._mode === 'byok' && !this._geminiKey.trim() && this._azureResourceOrEndpoint.trim() && this._azureApiKey.trim();
+
         if (this._mode === 'byok') {
-            if (this._hostedProvider === 'azure') {
+            if (this._hostedProvider === 'azure' || shouldUseAzureFallback) {
                 if (!this._azureResourceOrEndpoint.trim() || !this._azureApiKey.trim()) {
                     this._keyError = true;
                     this.requestUpdate();
@@ -924,11 +949,17 @@ export class MainView extends LitElement {
         return html`
             <div class="form-group">
                 <label class="form-label">Hosted Provider</label>
-                <select .value=${this._hostedProvider} @change=${e => this._saveHostedProvider(e.target.value)}>
-                    <option value="gemini" ?selected=${this._hostedProvider === 'gemini'}>Current hosted provider</option>
-                    <option value="azure" ?selected=${this._hostedProvider === 'azure'}>Azure OpenAI</option>
-                </select>
-                <div class="form-hint">Choose between the current Gemini/Groq stack or Azure BYOK.</div>
+                <div class="mode-cards">
+                    <button class="mode-card ${this._hostedProvider === 'gemini' ? 'active' : ''}" @click=${() => this._saveHostedProvider('gemini')}>
+                        <span class="mode-card-title">Gemini + Groq</span>
+                        <span class="mode-card-desc">Current hosted flow with Gemini live input and optional Groq answer generation.</span>
+                    </button>
+                    <button class="mode-card ${this._hostedProvider === 'azure' ? 'active' : ''}" @click=${() => this._saveHostedProvider('azure')}>
+                        <span class="mode-card-title">Azure OpenAI</span>
+                        <span class="mode-card-desc">BYOK Azure resource, streamed answers, screenshot analysis, and diarized transcription.</span>
+                    </button>
+                </div>
+                <div class="form-hint">If Gemini is empty and Azure is configured, the app now falls back to Azure automatically.</div>
             </div>
 
             ${this._hostedProvider === 'azure'

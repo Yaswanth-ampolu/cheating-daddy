@@ -616,8 +616,10 @@ export class CheatingDaddyApp extends LitElement {
                 return;
             }
         } else {
-            const hostedProvider = prefs.hostedProvider || 'gemini';
             const creds = await cheatingDaddy.storage.getCredentials();
+            const hasGeminiConfig = Boolean((await cheatingDaddy.storage.getApiKey()) || '');
+            const hasAzureConfig = Boolean(creds.azureApiKey && prefs.azureResourceOrEndpoint && prefs.azureResourceOrEndpoint.trim());
+            const hostedProvider = !hasGeminiConfig && hasAzureConfig ? 'azure' : prefs.hostedProvider || 'gemini';
 
             if (hostedProvider === 'azure') {
                 if (!creds.azureApiKey || !prefs.azureResourceOrEndpoint || !prefs.azureResourceOrEndpoint.trim()) {
