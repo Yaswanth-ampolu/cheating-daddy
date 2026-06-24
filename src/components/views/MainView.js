@@ -518,6 +518,7 @@ export class MainView extends LitElement {
         _azureResourceOrEndpoint: { state: true },
         _azureApiKey: { state: true },
         _azureModelChoice: { state: true },
+        _azureTranscriptionDeployment: { state: true },
         _openaiKey: { state: true },
         _tokenError: { state: true },
         _keyError: { state: true },
@@ -545,6 +546,7 @@ export class MainView extends LitElement {
         this._azureResourceOrEndpoint = '';
         this._azureApiKey = '';
         this._azureModelChoice = 'gpt-4.1-mini';
+        this._azureTranscriptionDeployment = 'gpt-4o-transcribe-diarize';
         this._openaiKey = '';
         this._tokenError = false;
         this._keyError = false;
@@ -586,6 +588,7 @@ export class MainView extends LitElement {
             // Load hosted and local AI settings
             this._azureResourceOrEndpoint = prefs.azureResourceOrEndpoint || '';
             this._azureModelChoice = prefs.azureModelChoice || 'gpt-4.1-mini';
+            this._azureTranscriptionDeployment = prefs.azureTranscriptionDeployment || 'gpt-4o-transcribe-diarize';
             this._ollamaHost = prefs.ollamaHost || 'http://127.0.0.1:11434';
             this._ollamaModel = prefs.ollamaModel || 'llama3.1';
             this._whisperModel = prefs.whisperModel || 'Xenova/whisper-small';
@@ -798,6 +801,13 @@ export class MainView extends LitElement {
         this.requestUpdate();
     }
 
+    async _saveAzureTranscriptionDeployment(val) {
+        this._azureTranscriptionDeployment = val;
+        this._keyError = false;
+        await cheatingDaddy.storage.updatePreference('azureTranscriptionDeployment', val);
+        this.requestUpdate();
+    }
+
     async _saveOpenaiKey(val) {
         this._openaiKey = val;
         try {
@@ -952,28 +962,24 @@ export class MainView extends LitElement {
                 <div class="mode-cards">
                     <button class="mode-card ${this._hostedProvider === 'gemini' ? 'active' : ''}" @click=${() => this._saveHostedProvider('gemini')}>
                         <span class="mode-card-title">Gemini + Groq</span>
-                        <span class="mode-card-desc">Current hosted flow with Gemini live input and optional Groq answer generation.</span>
                     </button>
                     <button class="mode-card ${this._hostedProvider === 'azure' ? 'active' : ''}" @click=${() => this._saveHostedProvider('azure')}>
                         <span class="mode-card-title">Azure OpenAI</span>
-                        <span class="mode-card-desc">BYOK Azure resource, streamed answers, screenshot analysis, and diarized transcription.</span>
                     </button>
                 </div>
-                <div class="form-hint">If Gemini is empty and Azure is configured, the app now falls back to Azure automatically.</div>
             </div>
 
             ${this._hostedProvider === 'azure'
                 ? html`
                       <div class="form-group">
-                          <label class="form-label">Azure Resource Name or Endpoint</label>
+                          <label class="form-label">Azure Endpoint URL</label>
                           <input
                               type="text"
-                              placeholder="yaswanth-resource or https://<resource>.services.ai.azure.com/openai/v1"
+                              placeholder="https://<your-resource>.services.ai.azure.com/openai/v1"
                               .value=${this._azureResourceOrEndpoint}
                               @input=${e => this._saveAzureResourceOrEndpoint(e.target.value)}
                               class=${this._keyError ? 'error' : ''}
                           />
-                          <div class="form-hint">Resource names are converted to the standard Azure Foundry endpoint automatically.</div>
                       </div>
 
                       <div class="form-group">
@@ -985,7 +991,6 @@ export class MainView extends LitElement {
                               @input=${e => this._saveAzureApiKey(e.target.value)}
                               class=${this._keyError ? 'error' : ''}
                           />
-                          <div class="form-hint">Stored in the app like the other BYOK credentials.</div>
                       </div>
 
                       <div class="form-group">
@@ -994,27 +999,19 @@ export class MainView extends LitElement {
                               <option value="gpt-4.1-mini" ?selected=${this._azureModelChoice === 'gpt-4.1-mini'}>
                                   GPT-4.1 mini (default, fastest)
                               </option>
-                              <option value="gpt-5-mini" ?selected=${this._azureModelChoice === 'gpt-5-mini'}>GPT-5 mini (higher quality)</option>
+                              <option value="gpt-5.1" ?selected=${this._azureModelChoice === 'gpt-5.1'}>GPT-5.1 (higher quality)</option>
                           </select>
-                          <div class="form-hint">This selection is used for both screenshot analysis and final text answers.</div>
                       </div>
 
                       <div class="form-group">
-                          <div class="form-hint">
-                              Expected Azure deployment names:
-                              <code
-                                  style="font-family: var(--font-mono); font-size: 11px; background: var(--bg-elevated); padding: 1px 4px; border-radius: 3px;"
-                                  >cd-transcribe</code
-                              >,
-                              <code
-                                  style="font-family: var(--font-mono); font-size: 11px; background: var(--bg-elevated); padding: 1px 4px; border-radius: 3px;"
-                                  >cd-chat-4-1-mini</code
-                              >, and
-                              <code
-                                  style="font-family: var(--font-mono); font-size: 11px; background: var(--bg-elevated); padding: 1px 4px; border-radius: 3px;"
-                                  >cd-chat-5-mini</code
-                              >.
-                          </div>
+                          <label class="form-label">Azure Transcription Deployment</label>
+                          <input
+                              type="text"
+                              placeholder="gpt-4o-transcribe-diarize"
+                              .value=${this._azureTranscriptionDeployment}
+                              @input=${e => this._saveAzureTranscriptionDeployment(e.target.value)}
+                              class=${this._keyError ? 'error' : ''}
+                          />
                       </div>
                   `
                 : html`

@@ -35,6 +35,7 @@ const DEFAULT_PREFERENCES = {
     whisperModel: 'Xenova/whisper-small',
     azureResourceOrEndpoint: '',
     azureModelChoice: 'gpt-4.1-mini',
+    azureTranscriptionDeployment: 'gpt-4o-transcribe-diarize',
 };
 
 const DEFAULT_KEYBINDS = null; // null means use system defaults

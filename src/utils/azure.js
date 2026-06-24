@@ -2,12 +2,11 @@ const OpenAI = require('openai');
 const { getSystemPrompt } = require('./prompts');
 const { sendToRenderer, initializeNewSession, saveConversationTurn, saveScreenAnalysis } = require('./gemini');
 
-const { toFile } = OpenAI;
+const TRANSCRIPTION_API_VERSION = '2025-04-01-preview';
 
-const TRANSCRIBE_DEPLOYMENT = 'cd-transcribe';
 const CHAT_DEPLOYMENTS = {
-    'gpt-4.1-mini': 'cd-chat-4-1-mini',
-    'gpt-5-mini': 'cd-chat-5-mini',
+    'gpt-4.1-mini': 'gpt-4.1-mini',
+    'gpt-5.1': 'gpt-5.1',
 };
 
 const VAD_MODES = {
@@ -20,7 +19,10 @@ const VAD_MODES = {
 let vadConfig = VAD_MODES.VERY_AGGRESSIVE;
 let azureClient = null;
 let azureBaseUrl = null;
+let azureClassicBaseUrl = null;
+let azureApiKey = null;
 let azureModelChoice = 'gpt-4.1-mini';
+let azureTranscriptionDeployment = 'gpt-4o-transcribe-diarize';
 let azureLanguage = 'en';
 let azureConversationHistory = [];
 let currentSystemPrompt = null;
@@ -52,6 +54,25 @@ function normalizeAzureBaseUrl(resourceOrEndpoint) {
         .split('/')[0]
         .split('.')[0];
     return `https://${resourceName}.services.ai.azure.com/openai/v1`;
+}
+
+function normalizeAzureClassicBaseUrl(resourceOrEndpoint) {
+    const raw = (resourceOrEndpoint || '').trim().replace(/\/+$/, '');
+    if (!raw) return '';
+
+    let host = raw;
+    if (/^https?:\/\//i.test(raw)) {
+        host = new URL(raw).hostname;
+    } else {
+        host = raw.split('/')[0];
+    }
+
+    if (host.endsWith('.openai.azure.com')) {
+        return `https://${host}`;
+    }
+
+    const resourceName = host.split('.')[0];
+    return `https://${resourceName}.openai.azure.com`;
 }
 
 function normalizeLanguage(language) {
@@ -164,23 +185,32 @@ function formatDiarizedTranscript(transcription) {
 }
 
 async function transcribeAudio(audioData) {
-    if (!azureClient) {
+    if (!azureClient || !azureClassicBaseUrl) {
         return '';
     }
 
     const wavBuffer = pcm16ToWav(audioData, 16000, 1);
-    const file = await toFile(wavBuffer, 'segment.wav', { type: 'audio/wav' });
-    const params = {
-        model: TRANSCRIBE_DEPLOYMENT,
-        file,
-        response_format: 'diarized_json',
-    };
-
+    const form = new FormData();
+    form.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), 'segment.wav');
+    form.append('response_format', 'diarized_json');
     if (azureLanguage) {
-        params.language = azureLanguage;
+        form.append('language', azureLanguage);
     }
 
-    const result = await azureClient.audio.transcriptions.create(params);
+    const endpoint = `${azureClassicBaseUrl}/openai/deployments/${encodeURIComponent(azureTranscriptionDeployment || 'gpt-4o-transcribe-diarize')}/audio/transcriptions?api-version=${TRANSCRIPTION_API_VERSION}`;
+    const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+            'api-key': azureApiKey,
+        },
+        body: form,
+    });
+
+    if (!response.ok) {
+        throw new Error(`Azure transcription error ${response.status}: ${await response.text()}`);
+    }
+
+    const result = await response.json();
     return formatDiarizedTranscript(result);
 }
 
@@ -311,6 +341,7 @@ async function initializeAzureSession({
     apiKey,
     resourceOrEndpoint,
     modelChoice = 'gpt-4.1-mini',
+    transcriptionDeployment = 'gpt-4o-transcribe-diarize',
     customPrompt = '',
     profile = 'interview',
     language = 'en-US',
@@ -319,7 +350,10 @@ async function initializeAzureSession({
 
     try {
         azureBaseUrl = normalizeAzureBaseUrl(resourceOrEndpoint);
+        azureClassicBaseUrl = normalizeAzureClassicBaseUrl(resourceOrEndpoint);
+        azureApiKey = apiKey;
         azureModelChoice = modelChoice;
+        azureTranscriptionDeployment = transcriptionDeployment;
         azureLanguage = normalizeLanguage(language);
         currentSystemPrompt = getSystemPrompt(profile, customPrompt, false);
         azureClient = new OpenAI({
@@ -446,6 +480,9 @@ function closeAzureSession() {
     azureConversationHistory = [];
     currentSystemPrompt = null;
     azureBaseUrl = null;
+    azureClassicBaseUrl = null;
+    azureApiKey = null;
+    azureTranscriptionDeployment = 'gpt-4o-transcribe-diarize';
     turnQueue = Promise.resolve();
 
     if (activeStream && typeof activeStream.abort === 'function') {
