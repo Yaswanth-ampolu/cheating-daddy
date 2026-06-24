@@ -123,6 +123,23 @@ export class MainView extends LitElement {
             letter-spacing: 0.5px;
         }
 
+        details.form-group {
+            gap: 0;
+        }
+
+        details.form-group summary {
+            cursor: pointer;
+            list-style: none;
+        }
+
+        details.form-group summary::-webkit-details-marker {
+            display: none;
+        }
+
+        details.form-group > input {
+            margin-top: var(--space-xs);
+        }
+
         input,
         select,
         textarea {
@@ -519,6 +536,7 @@ export class MainView extends LitElement {
         _azureApiKey: { state: true },
         _azureModelChoice: { state: true },
         _azureTranscriptionDeployment: { state: true },
+        _azureRealtimeDeployment: { state: true },
         _openaiKey: { state: true },
         _tokenError: { state: true },
         _keyError: { state: true },
@@ -547,6 +565,7 @@ export class MainView extends LitElement {
         this._azureApiKey = '';
         this._azureModelChoice = 'gpt-4.1-mini';
         this._azureTranscriptionDeployment = 'gpt-4o-transcribe-diarize';
+        this._azureRealtimeDeployment = '';
         this._openaiKey = '';
         this._tokenError = false;
         this._keyError = false;
@@ -589,6 +608,7 @@ export class MainView extends LitElement {
             this._azureResourceOrEndpoint = prefs.azureResourceOrEndpoint || '';
             this._azureModelChoice = prefs.azureModelChoice || 'gpt-4.1-mini';
             this._azureTranscriptionDeployment = prefs.azureTranscriptionDeployment || 'gpt-4o-transcribe-diarize';
+            this._azureRealtimeDeployment = prefs.azureRealtimeDeployment || '';
             this._ollamaHost = prefs.ollamaHost || 'http://127.0.0.1:11434';
             this._ollamaModel = prefs.ollamaModel || 'llama3.1';
             this._whisperModel = prefs.whisperModel || 'Xenova/whisper-small';
@@ -808,6 +828,13 @@ export class MainView extends LitElement {
         this.requestUpdate();
     }
 
+    async _saveAzureRealtimeDeployment(val) {
+        this._azureRealtimeDeployment = val;
+        this._keyError = false;
+        await cheatingDaddy.storage.updatePreference('azureRealtimeDeployment', val);
+        this.requestUpdate();
+    }
+
     async _saveOpenaiKey(val) {
         this._openaiKey = val;
         try {
@@ -1013,6 +1040,17 @@ export class MainView extends LitElement {
                               class=${this._keyError ? 'error' : ''}
                           />
                       </div>
+
+                      <details class="form-group" ?open=${Boolean(this._azureRealtimeDeployment.trim())}>
+                          <summary class="form-label">Advanced</summary>
+                          <input
+                              type="text"
+                              placeholder="Realtime deployment name"
+                              .value=${this._azureRealtimeDeployment}
+                              @input=${e => this._saveAzureRealtimeDeployment(e.target.value)}
+                              class=${this._keyError ? 'error' : ''}
+                          />
+                      </details>
                   `
                 : html`
                       <div class="form-group">

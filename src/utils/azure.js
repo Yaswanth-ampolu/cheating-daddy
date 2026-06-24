@@ -1,8 +1,23 @@
 const OpenAI = require('openai');
+const { AzureOpenAI } = require('openai');
+const { OpenAIRealtimeWebSocket } = require('openai/beta/realtime/websocket');
 const { getSystemPrompt } = require('./prompts');
 const { sendToRenderer, initializeNewSession, saveConversationTurn, saveScreenAnalysis } = require('./gemini');
 
 const TRANSCRIPTION_API_VERSION = '2025-04-01-preview';
+const AZURE_REALTIME_API_VERSION = '2025-04-01-preview';
+const AZURE_REALTIME_LISTENING_STATUS = 'Azure live - Listening...';
+const AZURE_BATCH_LISTENING_STATUS = 'Azure - Listening...';
+const AZURE_RESPONSE_STYLE_SUFFIX = `
+
+Azure answer style
+-----
+- Provide the exact words to say next.
+- Stay concise, but do not under-answer.
+- Prefer 2-4 short bullets or 2-4 short sentences when that gives a stronger answer.
+- Lead with the strongest specific point first.
+- Avoid coaching meta-commentary.
+-----`;
 
 const CHAT_DEPLOYMENTS = {
     'gpt-4.1-mini': 'gpt-4.1-mini',
@@ -18,11 +33,14 @@ const VAD_MODES = {
 
 let vadConfig = VAD_MODES.VERY_AGGRESSIVE;
 let azureClient = null;
+let azureRealtimeClient = null;
+let azureRealtimeSocket = null;
 let azureBaseUrl = null;
 let azureClassicBaseUrl = null;
 let azureApiKey = null;
 let azureModelChoice = 'gpt-4.1-mini';
 let azureTranscriptionDeployment = 'gpt-4o-transcribe-diarize';
+let azureRealtimeDeployment = '';
 let azureLanguage = 'en';
 let azureConversationHistory = [];
 let currentSystemPrompt = null;
@@ -34,6 +52,10 @@ let speechFrameCount = 0;
 let resampleRemainder = Buffer.alloc(0);
 let activeStream = null;
 let turnQueue = Promise.resolve();
+let azureRealtimeReady = false;
+let azureRealtimeClosing = false;
+let azureRealtimePartialTranscript = '';
+let azureRealtimeProcessedItems = new Set();
 
 function normalizeAzureBaseUrl(resourceOrEndpoint) {
     const raw = (resourceOrEndpoint || '').trim().replace(/\/+$/, '');
@@ -82,6 +104,10 @@ function normalizeLanguage(language) {
 
 function getAnswerDeployment(modelChoice = azureModelChoice) {
     return CHAT_DEPLOYMENTS[modelChoice] || CHAT_DEPLOYMENTS['gpt-4.1-mini'];
+}
+
+function buildAzureSystemPrompt(profile, customPrompt) {
+    return `${getSystemPrompt(profile, customPrompt, false)}${AZURE_RESPONSE_STYLE_SUFFIX}`;
 }
 
 function trimConversationHistory(maxTurns = 20) {
@@ -184,6 +210,42 @@ function formatDiarizedTranscript(transcription) {
         .join('\n');
 }
 
+function isAbortError(error) {
+    const message = (error?.message || '').toLowerCase();
+    return error?.name === 'AbortError' || message.includes('aborted') || message.includes('abort');
+}
+
+function resetBatchAudioState() {
+    isSpeaking = false;
+    speechBuffers = [];
+    silenceFrameCount = 0;
+    speechFrameCount = 0;
+    resampleRemainder = Buffer.alloc(0);
+}
+
+function resetRealtimeState() {
+    azureRealtimeReady = false;
+    azureRealtimeClosing = false;
+    azureRealtimePartialTranscript = '';
+    azureRealtimeProcessedItems = new Set();
+}
+
+function setListeningStatus() {
+    sendToRenderer('update-status', azureRealtimeReady ? AZURE_REALTIME_LISTENING_STATUS : AZURE_BATCH_LISTENING_STATUS);
+}
+
+function abortActiveResponse() {
+    if (!activeStream || typeof activeStream.abort !== 'function') {
+        return;
+    }
+
+    try {
+        activeStream.abort();
+    } catch (error) {
+        console.warn('[Azure] Failed to abort active response:', error.message);
+    }
+}
+
 async function transcribeAudio(audioData) {
     if (!azureClient || !azureClassicBaseUrl) {
         return '';
@@ -228,6 +290,210 @@ function buildHistoryInput(userText) {
     return history;
 }
 
+function closeRealtimeSocket() {
+    azureRealtimeClosing = true;
+
+    if (azureRealtimeSocket) {
+        try {
+            azureRealtimeSocket.close({ code: 1000, reason: 'Session closing' });
+        } catch (error) {
+            console.warn('[Azure Realtime] Close warning:', error.message);
+        }
+    }
+
+    azureRealtimeSocket = null;
+    azureRealtimeClient = null;
+    resetRealtimeState();
+}
+
+function fallbackToBatchMode(message) {
+    if (!isAzureActive) return;
+
+    console.warn('[Azure Realtime] Falling back to batch mode:', message);
+    closeRealtimeSocket();
+    resetBatchAudioState();
+    sendToRenderer('update-status', `Azure live unavailable, using standard mode. ${message}`);
+}
+
+function buildRealtimeSessionUpdate() {
+    return {
+        type: 'session.update',
+        session: {
+            instructions: 'Transcribe the conversation accurately. Do not answer or speak.',
+            modalities: ['text'],
+            input_audio_format: 'pcm16',
+            input_audio_transcription: {
+                model: azureTranscriptionDeployment || 'gpt-4o-transcribe-diarize',
+                ...(azureLanguage ? { language: azureLanguage } : {}),
+            },
+            turn_detection: {
+                type: 'server_vad',
+                create_response: false,
+                interrupt_response: true,
+                prefix_padding_ms: 300,
+                silence_duration_ms: 450,
+                threshold: 0.45,
+            },
+        },
+    };
+}
+
+function getRealtimeFailureMessage(event) {
+    if (event?.error?.message) {
+        return event.error.message;
+    }
+    return 'Realtime transcription failed';
+}
+
+function registerRealtimeEventHandlers(realtimeSocket, complete) {
+    realtimeSocket.on('error', error => {
+        console.error('[Azure Realtime] Error:', error);
+        if (!azureRealtimeReady) {
+            closeRealtimeSocket();
+            complete(false);
+            return;
+        }
+        if (!azureRealtimeClosing) {
+            fallbackToBatchMode(error.message || 'Realtime connection error');
+        }
+    });
+
+    realtimeSocket.on('session.updated', () => {
+        azureRealtimeReady = true;
+        setListeningStatus();
+        complete(true);
+    });
+
+    realtimeSocket.on('input_audio_buffer.speech_started', () => {
+        abortActiveResponse();
+        sendToRenderer('update-status', 'Azure live - Speech detected...');
+    });
+
+    realtimeSocket.on('input_audio_buffer.speech_stopped', () => {
+        sendToRenderer('update-status', 'Azure live - Transcribing...');
+    });
+
+    realtimeSocket.on('conversation.item.input_audio_transcription.delta', event => {
+        azureRealtimePartialTranscript += event.delta || '';
+    });
+
+    realtimeSocket.on('conversation.item.input_audio_transcription.failed', event => {
+        fallbackToBatchMode(getRealtimeFailureMessage(event));
+    });
+
+    realtimeSocket.on('conversation.item.input_audio_transcription.completed', event => {
+        const itemId = event.item_id || '';
+        if (itemId && azureRealtimeProcessedItems.has(itemId)) {
+            return;
+        }
+        if (itemId) {
+            azureRealtimeProcessedItems.add(itemId);
+        }
+
+        const transcript = (event.transcript || azureRealtimePartialTranscript || '').trim();
+        azureRealtimePartialTranscript = '';
+
+        if (!transcript || transcript.length < 2) {
+            setListeningStatus();
+            return;
+        }
+
+        queueTurn(() =>
+            streamAzureResponse({
+                userText: transcript,
+                input: buildHistoryInput(transcript),
+                saveTurn: true,
+            })
+        );
+    });
+}
+
+function bindRealtimeSocketLifecycle(realtimeSocket, complete) {
+    const bindSocketEvent = (socket, eventName, handler) => {
+        if (typeof socket.addEventListener === 'function') {
+            socket.addEventListener(eventName, handler);
+            return;
+        }
+        if (typeof socket.on === 'function') {
+            socket.on(eventName, handler);
+        }
+    };
+
+    bindSocketEvent(realtimeSocket.socket, 'open', () => {
+        try {
+            realtimeSocket.send(buildRealtimeSessionUpdate());
+            setTimeout(() => {
+                if (!azureRealtimeReady) {
+                    azureRealtimeReady = true;
+                    setListeningStatus();
+                    complete(true);
+                }
+            }, 1500);
+        } catch (error) {
+            console.error('[Azure Realtime] Failed to configure session:', error);
+            closeRealtimeSocket();
+            complete(false);
+        }
+    });
+
+    bindSocketEvent(realtimeSocket.socket, 'close', event => {
+        if (!azureRealtimeReady) {
+            closeRealtimeSocket();
+            complete(false);
+            return;
+        }
+        if (!azureRealtimeClosing) {
+            fallbackToBatchMode(`Realtime socket closed (${event.code || 'unknown'})`);
+        }
+    });
+}
+
+async function initializeRealtimeSession() {
+    if (!azureRealtimeDeployment || !azureRealtimeDeployment.trim()) {
+        return false;
+    }
+
+    try {
+        resetRealtimeState();
+        azureRealtimeClient = new AzureOpenAI({
+            endpoint: azureClassicBaseUrl,
+            apiKey: azureApiKey,
+            apiVersion: AZURE_REALTIME_API_VERSION,
+        });
+
+        const realtimeSocket = await OpenAIRealtimeWebSocket.azure(azureRealtimeClient, {
+            deploymentName: azureRealtimeDeployment.trim(),
+        });
+
+        azureRealtimeSocket = realtimeSocket;
+        azureRealtimeClosing = false;
+
+        return await new Promise(resolve => {
+            let settled = false;
+            const timeout = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                closeRealtimeSocket();
+                resolve(false);
+            }, 10000);
+
+            const complete = success => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeout);
+                resolve(success);
+            };
+
+            registerRealtimeEventHandlers(realtimeSocket, complete);
+            bindRealtimeSocketLifecycle(realtimeSocket, complete);
+        });
+    } catch (error) {
+        console.error('[Azure Realtime] Initialization failed:', error);
+        closeRealtimeSocket();
+        return false;
+    }
+}
+
 async function streamAzureResponse({ userText, input, saveTurn = true }) {
     if (!azureClient || !isAzureActive) {
         return { success: false, error: 'No active Azure session' };
@@ -238,10 +504,13 @@ async function streamAzureResponse({ userText, input, saveTurn = true }) {
     let isFirst = true;
 
     try {
+        sendToRenderer('update-status', 'Generating response...');
+
         activeStream = azureClient.responses.stream({
             model: deployment,
             instructions: currentSystemPrompt || 'You are a helpful assistant.',
             input,
+            max_output_tokens: 320,
         });
 
         activeStream.on('response.output_text.delta', event => {
@@ -266,9 +535,14 @@ async function streamAzureResponse({ userText, input, saveTurn = true }) {
             saveConversationTurn(userText, cleanedText);
         }
 
-        sendToRenderer('update-status', 'Listening...');
+        setListeningStatus();
         return { success: true, text: cleanedText, model: deployment };
     } catch (error) {
+        if (isAbortError(error)) {
+            setListeningStatus();
+            return { success: false, aborted: true, error: error.message };
+        }
+
         console.error('[Azure] Response error:', error);
         sendToRenderer('update-status', 'Azure error: ' + error.message);
         return { success: false, error: error.message };
@@ -281,7 +555,7 @@ async function handleSpeechEnd(audioData) {
     if (!isAzureActive) return;
 
     if (audioData.length < 16000) {
-        sendToRenderer('update-status', 'Listening...');
+        setListeningStatus();
         return;
     }
 
@@ -290,11 +564,10 @@ async function handleSpeechEnd(audioData) {
         const transcription = await transcribeAudio(audioData);
 
         if (!transcription || transcription.trim().length < 2) {
-            sendToRenderer('update-status', 'Listening...');
+            setListeningStatus();
             return;
         }
 
-        sendToRenderer('update-status', 'Generating response...');
         await streamAzureResponse({
             userText: transcription.trim(),
             input: buildHistoryInput(transcription.trim()),
@@ -306,7 +579,7 @@ async function handleSpeechEnd(audioData) {
     }
 }
 
-function processVAD(pcm16kBuffer) {
+function processBatchVAD(pcm16kBuffer) {
     const rms = calculateRMS(pcm16kBuffer);
     const isVoice = rms > vadConfig.energyThreshold;
 
@@ -317,6 +590,7 @@ function processVAD(pcm16kBuffer) {
         if (!isSpeaking && speechFrameCount >= vadConfig.speechFramesRequired) {
             isSpeaking = true;
             speechBuffers = [];
+            abortActiveResponse();
             sendToRenderer('update-status', 'Listening... (speech detected)');
         }
     } else {
@@ -342,6 +616,7 @@ async function initializeAzureSession({
     resourceOrEndpoint,
     modelChoice = 'gpt-4.1-mini',
     transcriptionDeployment = 'gpt-4o-transcribe-diarize',
+    realtimeDeployment = '',
     customPrompt = '',
     profile = 'interview',
     language = 'en-US',
@@ -354,30 +629,36 @@ async function initializeAzureSession({
         azureApiKey = apiKey;
         azureModelChoice = modelChoice;
         azureTranscriptionDeployment = transcriptionDeployment;
+        azureRealtimeDeployment = (realtimeDeployment || '').trim();
         azureLanguage = normalizeLanguage(language);
-        currentSystemPrompt = getSystemPrompt(profile, customPrompt, false);
+        currentSystemPrompt = buildAzureSystemPrompt(profile, customPrompt);
         azureClient = new OpenAI({
             apiKey,
             baseURL: azureBaseUrl,
         });
 
         azureConversationHistory = [];
-        isSpeaking = false;
-        speechBuffers = [];
-        silenceFrameCount = 0;
-        speechFrameCount = 0;
-        resampleRemainder = Buffer.alloc(0);
+        resetBatchAudioState();
+        resetRealtimeState();
         turnQueue = Promise.resolve();
         initializeNewSession(profile, customPrompt);
         isAzureActive = true;
 
+        if (azureRealtimeDeployment) {
+            const realtimeReady = await initializeRealtimeSession();
+            if (!realtimeReady) {
+                console.warn('[Azure] Realtime unavailable, using batch mode');
+            }
+        }
+
         sendToRenderer('session-initializing', false);
-        sendToRenderer('update-status', 'Azure ready - Listening...');
+        setListeningStatus();
         return true;
     } catch (error) {
         console.error('[Azure] Initialization error:', error);
         isAzureActive = false;
         azureClient = null;
+        closeRealtimeSocket();
         sendToRenderer('session-initializing', false);
         sendToRenderer('update-status', 'Azure init error: ' + error.message);
         return false;
@@ -386,9 +667,23 @@ async function initializeAzureSession({
 
 function processAzureAudio(monoChunk24k) {
     if (!isAzureActive) return;
+
+    if (azureRealtimeReady && azureRealtimeSocket) {
+        try {
+            azureRealtimeSocket.send({
+                type: 'input_audio_buffer.append',
+                audio: monoChunk24k.toString('base64'),
+            });
+            return;
+        } catch (error) {
+            console.error('[Azure Realtime] Audio append failed:', error);
+            fallbackToBatchMode(error.message || 'Unable to append audio');
+        }
+    }
+
     const pcm16k = resample24kTo16k(monoChunk24k);
     if (pcm16k.length > 0) {
-        processVAD(pcm16k);
+        processBatchVAD(pcm16k);
     }
 }
 
@@ -402,7 +697,6 @@ async function sendAzureText(text) {
         return { success: false, error: 'Empty text message' };
     }
 
-    sendToRenderer('update-status', 'Generating response...');
     return queueTurn(() =>
         streamAzureResponse({
             userText: trimmedText,
@@ -427,6 +721,7 @@ async function sendAzureImage(base64Data, prompt) {
         activeStream = azureClient.responses.stream({
             model: deployment,
             instructions: currentSystemPrompt || 'You are a helpful assistant.',
+            max_output_tokens: 320,
             input: [
                 {
                     role: 'user',
@@ -459,9 +754,14 @@ async function sendAzureImage(base64Data, prompt) {
             saveScreenAnalysis(prompt, fullText, deployment);
         }
 
-        sendToRenderer('update-status', 'Listening...');
+        setListeningStatus();
         return { success: true, text: fullText.trim(), model: deployment };
     } catch (error) {
+        if (isAbortError(error)) {
+            setListeningStatus();
+            return { success: false, aborted: true, error: error.message };
+        }
+
         console.error('[Azure] Image error:', error);
         sendToRenderer('update-status', 'Azure image error: ' + error.message);
         return { success: false, error: error.message };
@@ -472,27 +772,20 @@ async function sendAzureImage(base64Data, prompt) {
 
 function closeAzureSession() {
     isAzureActive = false;
-    isSpeaking = false;
-    speechBuffers = [];
-    silenceFrameCount = 0;
-    speechFrameCount = 0;
-    resampleRemainder = Buffer.alloc(0);
+    resetBatchAudioState();
+    closeRealtimeSocket();
     azureConversationHistory = [];
     currentSystemPrompt = null;
     azureBaseUrl = null;
     azureClassicBaseUrl = null;
     azureApiKey = null;
+    azureModelChoice = 'gpt-4.1-mini';
     azureTranscriptionDeployment = 'gpt-4o-transcribe-diarize';
+    azureRealtimeDeployment = '';
+    azureLanguage = 'en';
     turnQueue = Promise.resolve();
 
-    if (activeStream && typeof activeStream.abort === 'function') {
-        try {
-            activeStream.abort();
-        } catch (error) {
-            console.warn('[Azure] Failed to abort active stream:', error.message);
-        }
-    }
-
+    abortActiveResponse();
     activeStream = null;
     azureClient = null;
 }

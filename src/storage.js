@@ -36,6 +36,7 @@ const DEFAULT_PREFERENCES = {
     azureResourceOrEndpoint: '',
     azureModelChoice: 'gpt-4.1-mini',
     azureTranscriptionDeployment: 'gpt-4o-transcribe-diarize',
+    azureRealtimeDeployment: '',
 };
 
 const DEFAULT_KEYBINDS = null; // null means use system defaults

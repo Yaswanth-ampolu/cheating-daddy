@@ -209,6 +209,7 @@ async function initializeAzure(profile = 'interview', language = 'en-US') {
         resourceOrEndpoint,
         modelChoice: prefs.azureModelChoice || 'gpt-4.1-mini',
         transcriptionDeployment: prefs.azureTranscriptionDeployment || 'gpt-4o-transcribe-diarize',
+        realtimeDeployment: prefs.azureRealtimeDeployment || '',
         customPrompt: prefs.customPrompt || '',
         profile,
         language,
