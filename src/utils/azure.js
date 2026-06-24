@@ -7,28 +7,45 @@ const { sendToRenderer, initializeNewSession, saveConversationTurn, saveScreenAn
 const TRANSCRIPTION_API_VERSION = '2025-04-01-preview';
 const AZURE_REALTIME_API_VERSION = '2025-04-01-preview';
 const AZURE_REALTIME_LISTENING_STATUS = 'Azure live - Listening...';
-const AZURE_BATCH_LISTENING_STATUS = 'Azure - Listening...';
-const AZURE_RESPONSE_STYLE_SUFFIX = `
+const AZURE_STANDARD_LISTENING_STATUS = 'Azure - Listening...';
+const AZURE_STANDARD_RESPONSE_STYLE_SUFFIX = `
 
 Azure answer style
 -----
 - Provide the exact words to say next.
 - Stay concise, but do not under-answer.
-- Prefer 2-4 short bullets or 2-4 short sentences when that gives a stronger answer.
+- Prefer 3-5 short bullets or 3-5 short sentences when that gives a stronger answer.
 - Lead with the strongest specific point first.
 - Avoid coaching meta-commentary.
 -----`;
+const AZURE_LIVE_RESPONSE_STYLE_SUFFIX = `
+
+Azure live mode override
+-----
+- Override any earlier 1-3 sentence cap when the moment needs more detail.
+- Give direct, ready-to-say answers that sound complete, not clipped.
+- Prefer 4-8 short bullets or 4-6 short sentences when substance helps.
+- Include concrete examples, tradeoffs, or next steps when they materially improve the answer.
+- Avoid filler, but do not compress away useful detail.
+-----`;
 
 const CHAT_DEPLOYMENTS = {
+    'gpt-4.1-nano': 'gpt-4.1-nano',
     'gpt-4.1-mini': 'gpt-4.1-mini',
     'gpt-5.1': 'gpt-5.1',
+};
+
+const LIVE_DEPLOYMENTS = {
+    'gpt-realtime-1.5': 'gpt-realtime-1.5',
+    'gpt-realtime': 'gpt-realtime',
+    'gpt-realtime-mini': 'gpt-realtime-mini',
 };
 
 const VAD_MODES = {
     NORMAL: { energyThreshold: 0.01, speechFramesRequired: 3, silenceFramesRequired: 30 },
     LOW_BITRATE: { energyThreshold: 0.008, speechFramesRequired: 4, silenceFramesRequired: 35 },
     AGGRESSIVE: { energyThreshold: 0.015, speechFramesRequired: 2, silenceFramesRequired: 20 },
-    VERY_AGGRESSIVE: { energyThreshold: 0.02, speechFramesRequired: 2, silenceFramesRequired: 15 },
+    VERY_AGGRESSIVE: { energyThreshold: 0.02, speechFramesRequired: 2, silenceFramesRequired: 8 },
 };
 
 let vadConfig = VAD_MODES.VERY_AGGRESSIVE;
@@ -38,6 +55,8 @@ let azureRealtimeSocket = null;
 let azureBaseUrl = null;
 let azureClassicBaseUrl = null;
 let azureApiKey = null;
+let azureSessionMode = 'live';
+let azureLiveModelChoice = 'gpt-realtime-1.5';
 let azureModelChoice = 'gpt-4.1-mini';
 let azureTranscriptionDeployment = 'gpt-4o-transcribe-diarize';
 let azureRealtimeDeployment = '';
@@ -54,8 +73,8 @@ let activeStream = null;
 let turnQueue = Promise.resolve();
 let azureRealtimeReady = false;
 let azureRealtimeClosing = false;
-let azureRealtimePartialTranscript = '';
-let azureRealtimeProcessedItems = new Set();
+let azureRealtimeCurrentResponseText = '';
+let azureRealtimeIsFirstDelta = true;
 
 function normalizeAzureBaseUrl(resourceOrEndpoint) {
     const raw = (resourceOrEndpoint || '').trim().replace(/\/+$/, '');
@@ -106,8 +125,17 @@ function getAnswerDeployment(modelChoice = azureModelChoice) {
     return CHAT_DEPLOYMENTS[modelChoice] || CHAT_DEPLOYMENTS['gpt-4.1-mini'];
 }
 
-function buildAzureSystemPrompt(profile, customPrompt) {
-    return `${getSystemPrompt(profile, customPrompt, false)}${AZURE_RESPONSE_STYLE_SUFFIX}`;
+function getLiveDeployment(modelChoice = azureLiveModelChoice) {
+    return LIVE_DEPLOYMENTS[modelChoice] || LIVE_DEPLOYMENTS['gpt-realtime-1.5'];
+}
+
+function isLiveMode() {
+    return azureSessionMode === 'live';
+}
+
+function buildAzureSystemPrompt(profile, customPrompt, sessionMode = azureSessionMode) {
+    const modeSuffix = sessionMode === 'live' ? AZURE_LIVE_RESPONSE_STYLE_SUFFIX : AZURE_STANDARD_RESPONSE_STYLE_SUFFIX;
+    return `${getSystemPrompt(profile, customPrompt, false)}${modeSuffix}`;
 }
 
 function trimConversationHistory(maxTurns = 20) {
@@ -226,12 +254,13 @@ function resetBatchAudioState() {
 function resetRealtimeState() {
     azureRealtimeReady = false;
     azureRealtimeClosing = false;
-    azureRealtimePartialTranscript = '';
-    azureRealtimeProcessedItems = new Set();
+    azureRealtimeCurrentResponseText = '';
+    azureRealtimeIsFirstDelta = true;
 }
 
 function setListeningStatus() {
-    sendToRenderer('update-status', azureRealtimeReady ? AZURE_REALTIME_LISTENING_STATUS : AZURE_BATCH_LISTENING_STATUS);
+    const status = isLiveMode() && azureRealtimeReady ? AZURE_REALTIME_LISTENING_STATUS : AZURE_STANDARD_LISTENING_STATUS;
+    sendToRenderer('update-status', status);
 }
 
 function abortActiveResponse() {
@@ -243,6 +272,18 @@ function abortActiveResponse() {
         activeStream.abort();
     } catch (error) {
         console.warn('[Azure] Failed to abort active response:', error.message);
+    }
+}
+
+function cancelRealtimeResponse() {
+    if (!azureRealtimeSocket || !azureRealtimeReady) {
+        return;
+    }
+
+    try {
+        azureRealtimeSocket.send({ type: 'response.cancel' });
+    } catch (error) {
+        console.warn('[Azure Realtime] Failed to cancel active response:', error.message);
     }
 }
 
@@ -290,6 +331,44 @@ function buildHistoryInput(userText) {
     return history;
 }
 
+function persistConversationTurn(userText, assistantText) {
+    const cleanedAssistantText = (assistantText || '').trim();
+    if (!cleanedAssistantText) {
+        return;
+    }
+
+    const cleanedUserText = (userText || '').trim() || '[Live audio turn]';
+    azureConversationHistory.push({ role: 'user', content: cleanedUserText });
+    azureConversationHistory.push({ role: 'assistant', content: cleanedAssistantText });
+    trimConversationHistory();
+    saveConversationTurn(cleanedUserText, cleanedAssistantText);
+}
+
+function extractTextFromRealtimeResponse(response) {
+    if (!response) {
+        return '';
+    }
+    if (typeof response.output_text === 'string' && response.output_text.trim()) {
+        return response.output_text.trim();
+    }
+
+    const parts = [];
+    for (const item of response.output || []) {
+        if (typeof item?.text === 'string' && item.text.trim()) {
+            parts.push(item.text);
+        }
+        for (const contentPart of item?.content || []) {
+            if (typeof contentPart?.text === 'string' && contentPart.text.trim()) {
+                parts.push(contentPart.text);
+            } else if (typeof contentPart?.transcript === 'string' && contentPart.transcript.trim()) {
+                parts.push(contentPart.transcript);
+            }
+        }
+    }
+
+    return parts.join('').trim();
+}
+
 function closeRealtimeSocket() {
     azureRealtimeClosing = true;
 
@@ -309,7 +388,7 @@ function closeRealtimeSocket() {
 function fallbackToBatchMode(message) {
     if (!isAzureActive) return;
 
-    console.warn('[Azure Realtime] Falling back to batch mode:', message);
+    console.warn('[Azure Realtime] Falling back to standard mode:', message);
     closeRealtimeSocket();
     resetBatchAudioState();
     sendToRenderer('update-status', `Azure live unavailable, using standard mode. ${message}`);
@@ -319,30 +398,21 @@ function buildRealtimeSessionUpdate() {
     return {
         type: 'session.update',
         session: {
-            instructions: 'Transcribe the conversation accurately. Do not answer or speak.',
+            instructions: currentSystemPrompt || 'You are a helpful assistant.',
             modalities: ['text'],
             input_audio_format: 'pcm16',
-            input_audio_transcription: {
-                model: azureTranscriptionDeployment || 'gpt-4o-transcribe-diarize',
-                ...(azureLanguage ? { language: azureLanguage } : {}),
-            },
+            max_response_output_tokens: 640,
+            temperature: 0.7,
             turn_detection: {
                 type: 'server_vad',
-                create_response: false,
+                create_response: true,
                 interrupt_response: true,
-                prefix_padding_ms: 300,
-                silence_duration_ms: 450,
-                threshold: 0.45,
+                prefix_padding_ms: 200,
+                silence_duration_ms: 280,
+                threshold: 0.42,
             },
         },
     };
-}
-
-function getRealtimeFailureMessage(event) {
-    if (event?.error?.message) {
-        return event.error.message;
-    }
-    return 'Realtime transcription failed';
 }
 
 function registerRealtimeEventHandlers(realtimeSocket, complete) {
@@ -366,45 +436,42 @@ function registerRealtimeEventHandlers(realtimeSocket, complete) {
 
     realtimeSocket.on('input_audio_buffer.speech_started', () => {
         abortActiveResponse();
-        sendToRenderer('update-status', 'Azure live - Speech detected...');
+        cancelRealtimeResponse();
+        azureRealtimeCurrentResponseText = '';
+        azureRealtimeIsFirstDelta = true;
+        sendToRenderer('update-status', 'Azure live - Listening...');
     });
 
     realtimeSocket.on('input_audio_buffer.speech_stopped', () => {
-        sendToRenderer('update-status', 'Azure live - Transcribing...');
+        sendToRenderer('update-status', 'Azure live - Thinking...');
     });
 
-    realtimeSocket.on('conversation.item.input_audio_transcription.delta', event => {
-        azureRealtimePartialTranscript += event.delta || '';
+    realtimeSocket.on('response.created', () => {
+        azureRealtimeCurrentResponseText = '';
+        azureRealtimeIsFirstDelta = true;
+        sendToRenderer('update-status', 'Azure live - Responding...');
     });
 
-    realtimeSocket.on('conversation.item.input_audio_transcription.failed', event => {
-        fallbackToBatchMode(getRealtimeFailureMessage(event));
+    realtimeSocket.on('response.text.delta', event => {
+        if (!event?.delta) return;
+        azureRealtimeCurrentResponseText += event.delta;
+        sendToRenderer(azureRealtimeIsFirstDelta ? 'new-response' : 'update-response', azureRealtimeCurrentResponseText);
+        azureRealtimeIsFirstDelta = false;
     });
 
-    realtimeSocket.on('conversation.item.input_audio_transcription.completed', event => {
-        const itemId = event.item_id || '';
-        if (itemId && azureRealtimeProcessedItems.has(itemId)) {
-            return;
-        }
-        if (itemId) {
-            azureRealtimeProcessedItems.add(itemId);
-        }
+    realtimeSocket.on('response.done', event => {
+        const status = event?.response?.status || '';
+        const finalText = (azureRealtimeCurrentResponseText || extractTextFromRealtimeResponse(event?.response)).trim();
+        azureRealtimeCurrentResponseText = '';
+        azureRealtimeIsFirstDelta = true;
 
-        const transcript = (event.transcript || azureRealtimePartialTranscript || '').trim();
-        azureRealtimePartialTranscript = '';
-
-        if (!transcript || transcript.length < 2) {
+        if (status === 'cancelled' || !finalText) {
             setListeningStatus();
             return;
         }
 
-        queueTurn(() =>
-            streamAzureResponse({
-                userText: transcript,
-                input: buildHistoryInput(transcript),
-                saveTurn: true,
-            })
-        );
+        persistConversationTurn('[Live audio turn]', finalText);
+        setListeningStatus();
     });
 }
 
@@ -449,7 +516,7 @@ function bindRealtimeSocketLifecycle(realtimeSocket, complete) {
 }
 
 async function initializeRealtimeSession() {
-    if (!azureRealtimeDeployment || !azureRealtimeDeployment.trim()) {
+    if (!isLiveMode()) {
         return false;
     }
 
@@ -461,8 +528,9 @@ async function initializeRealtimeSession() {
             apiVersion: AZURE_REALTIME_API_VERSION,
         });
 
+        const deploymentName = getLiveDeployment();
         const realtimeSocket = await OpenAIRealtimeWebSocket.azure(azureRealtimeClient, {
-            deploymentName: azureRealtimeDeployment.trim(),
+            deploymentName,
         });
 
         azureRealtimeSocket = realtimeSocket;
@@ -510,7 +578,7 @@ async function streamAzureResponse({ userText, input, saveTurn = true }) {
             model: deployment,
             instructions: currentSystemPrompt || 'You are a helpful assistant.',
             input,
-            max_output_tokens: 320,
+            max_output_tokens: 560,
         });
 
         activeStream.on('response.output_text.delta', event => {
@@ -529,10 +597,7 @@ async function streamAzureResponse({ userText, input, saveTurn = true }) {
         const cleanedText = fullText.trim();
 
         if (saveTurn && cleanedText) {
-            azureConversationHistory.push({ role: 'user', content: userText });
-            azureConversationHistory.push({ role: 'assistant', content: cleanedText });
-            trimConversationHistory();
-            saveConversationTurn(userText, cleanedText);
+            persistConversationTurn(userText, cleanedText);
         }
 
         setListeningStatus();
@@ -614,6 +679,8 @@ function processBatchVAD(pcm16kBuffer) {
 async function initializeAzureSession({
     apiKey,
     resourceOrEndpoint,
+    sessionMode = 'live',
+    liveModelChoice = 'gpt-realtime-1.5',
     modelChoice = 'gpt-4.1-mini',
     transcriptionDeployment = 'gpt-4o-transcribe-diarize',
     realtimeDeployment = '',
@@ -627,11 +694,13 @@ async function initializeAzureSession({
         azureBaseUrl = normalizeAzureBaseUrl(resourceOrEndpoint);
         azureClassicBaseUrl = normalizeAzureClassicBaseUrl(resourceOrEndpoint);
         azureApiKey = apiKey;
+        azureSessionMode = sessionMode === 'standard' ? 'standard' : 'live';
+        azureLiveModelChoice = liveModelChoice || realtimeDeployment || 'gpt-realtime-1.5';
         azureModelChoice = modelChoice;
         azureTranscriptionDeployment = transcriptionDeployment;
-        azureRealtimeDeployment = (realtimeDeployment || '').trim();
+        azureRealtimeDeployment = azureLiveModelChoice;
         azureLanguage = normalizeLanguage(language);
-        currentSystemPrompt = buildAzureSystemPrompt(profile, customPrompt);
+        currentSystemPrompt = buildAzureSystemPrompt(profile, customPrompt, azureSessionMode);
         azureClient = new OpenAI({
             apiKey,
             baseURL: azureBaseUrl,
@@ -644,10 +713,10 @@ async function initializeAzureSession({
         initializeNewSession(profile, customPrompt);
         isAzureActive = true;
 
-        if (azureRealtimeDeployment) {
+        if (isLiveMode()) {
             const realtimeReady = await initializeRealtimeSession();
             if (!realtimeReady) {
-                console.warn('[Azure] Realtime unavailable, using batch mode');
+                console.warn('[Azure] Live session unavailable, using standard mode');
             }
         }
 
@@ -668,7 +737,7 @@ async function initializeAzureSession({
 function processAzureAudio(monoChunk24k) {
     if (!isAzureActive) return;
 
-    if (azureRealtimeReady && azureRealtimeSocket) {
+    if (isLiveMode() && azureRealtimeReady && azureRealtimeSocket) {
         try {
             azureRealtimeSocket.send({
                 type: 'input_audio_buffer.append',
@@ -721,7 +790,7 @@ async function sendAzureImage(base64Data, prompt) {
         activeStream = azureClient.responses.stream({
             model: deployment,
             instructions: currentSystemPrompt || 'You are a helpful assistant.',
-            max_output_tokens: 320,
+            max_output_tokens: 560,
             input: [
                 {
                     role: 'user',
@@ -779,6 +848,8 @@ function closeAzureSession() {
     azureBaseUrl = null;
     azureClassicBaseUrl = null;
     azureApiKey = null;
+    azureSessionMode = 'live';
+    azureLiveModelChoice = 'gpt-realtime-1.5';
     azureModelChoice = 'gpt-4.1-mini';
     azureTranscriptionDeployment = 'gpt-4o-transcribe-diarize';
     azureRealtimeDeployment = '';

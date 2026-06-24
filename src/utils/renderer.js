@@ -199,6 +199,8 @@ async function initializeCloud(profile = 'interview') {
 async function initializeAzure(profile = 'interview', language = 'en-US') {
     const [prefs, azureApiKey] = await Promise.all([storage.getPreferences(), storage.getAzureApiKey()]);
     const resourceOrEndpoint = prefs.azureResourceOrEndpoint || '';
+    const sessionMode = prefs.azureSessionMode || 'live';
+    const liveModelChoice = prefs.azureLiveModelChoice || prefs.azureRealtimeDeployment || 'gpt-realtime-1.5';
     if (!azureApiKey || !resourceOrEndpoint.trim()) {
         cheatingDaddy.setStatus('error');
         return false;
@@ -207,16 +209,18 @@ async function initializeAzure(profile = 'interview', language = 'en-US') {
     const success = await ipcRenderer.invoke('initialize-azure', {
         apiKey: azureApiKey,
         resourceOrEndpoint,
+        sessionMode,
+        liveModelChoice,
         modelChoice: prefs.azureModelChoice || 'gpt-4.1-mini',
         transcriptionDeployment: prefs.azureTranscriptionDeployment || 'gpt-4o-transcribe-diarize',
-        realtimeDeployment: prefs.azureRealtimeDeployment || '',
+        realtimeDeployment: liveModelChoice,
         customPrompt: prefs.customPrompt || '',
         profile,
         language,
     });
 
     if (success) {
-        cheatingDaddy.setStatus('Azure Live');
+        cheatingDaddy.setStatus(sessionMode === 'live' ? 'Azure Live' : 'Azure');
         return true;
     }
 

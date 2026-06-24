@@ -534,6 +534,8 @@ export class MainView extends LitElement {
         _groqKey: { state: true },
         _azureResourceOrEndpoint: { state: true },
         _azureApiKey: { state: true },
+        _azureSessionMode: { state: true },
+        _azureLiveModelChoice: { state: true },
         _azureModelChoice: { state: true },
         _azureTranscriptionDeployment: { state: true },
         _azureRealtimeDeployment: { state: true },
@@ -563,6 +565,8 @@ export class MainView extends LitElement {
         this._groqKey = '';
         this._azureResourceOrEndpoint = '';
         this._azureApiKey = '';
+        this._azureSessionMode = 'live';
+        this._azureLiveModelChoice = 'gpt-realtime-1.5';
         this._azureModelChoice = 'gpt-4.1-mini';
         this._azureTranscriptionDeployment = 'gpt-4o-transcribe-diarize';
         this._azureRealtimeDeployment = '';
@@ -606,6 +610,8 @@ export class MainView extends LitElement {
 
             // Load hosted and local AI settings
             this._azureResourceOrEndpoint = prefs.azureResourceOrEndpoint || '';
+            this._azureSessionMode = prefs.azureSessionMode || 'live';
+            this._azureLiveModelChoice = prefs.azureLiveModelChoice || prefs.azureRealtimeDeployment || 'gpt-realtime-1.5';
             this._azureModelChoice = prefs.azureModelChoice || 'gpt-4.1-mini';
             this._azureTranscriptionDeployment = prefs.azureTranscriptionDeployment || 'gpt-4o-transcribe-diarize';
             this._azureRealtimeDeployment = prefs.azureRealtimeDeployment || '';
@@ -815,6 +821,20 @@ export class MainView extends LitElement {
         this.requestUpdate();
     }
 
+    async _saveAzureSessionMode(val) {
+        this._azureSessionMode = val;
+        await cheatingDaddy.storage.updatePreference('azureSessionMode', val);
+        this.requestUpdate();
+    }
+
+    async _saveAzureLiveModelChoice(val) {
+        this._azureLiveModelChoice = val;
+        this._azureRealtimeDeployment = val;
+        await cheatingDaddy.storage.updatePreference('azureLiveModelChoice', val);
+        await cheatingDaddy.storage.updatePreference('azureRealtimeDeployment', val);
+        this.requestUpdate();
+    }
+
     async _saveAzureModelChoice(val) {
         this._azureModelChoice = val;
         await cheatingDaddy.storage.updatePreference('azureModelChoice', val);
@@ -1021,36 +1041,57 @@ export class MainView extends LitElement {
                       </div>
 
                       <div class="form-group">
-                          <label class="form-label">Azure Answer Model</label>
-                          <select .value=${this._azureModelChoice} @change=${e => this._saveAzureModelChoice(e.target.value)}>
-                              <option value="gpt-4.1-mini" ?selected=${this._azureModelChoice === 'gpt-4.1-mini'}>
-                                  GPT-4.1 mini (default, fastest)
-                              </option>
-                              <option value="gpt-5.1" ?selected=${this._azureModelChoice === 'gpt-5.1'}>GPT-5.1 (higher quality)</option>
-                          </select>
+                          <label class="form-label">Azure Audio Mode</label>
+                          <div class="mode-cards">
+                              <button
+                                  class="mode-card ${this._azureSessionMode === 'live' ? 'active' : ''}"
+                                  @click=${() => this._saveAzureSessionMode('live')}
+                              >
+                                  <span class="mode-card-title">Live</span>
+                              </button>
+                              <button
+                                  class="mode-card ${this._azureSessionMode === 'standard' ? 'active' : ''}"
+                                  @click=${() => this._saveAzureSessionMode('standard')}
+                              >
+                                  <span class="mode-card-title">Standard</span>
+                              </button>
+                          </div>
                       </div>
 
-                      <div class="form-group">
-                          <label class="form-label">Azure Transcription Deployment</label>
-                          <input
-                              type="text"
-                              placeholder="gpt-4o-transcribe-diarize"
-                              .value=${this._azureTranscriptionDeployment}
-                              @input=${e => this._saveAzureTranscriptionDeployment(e.target.value)}
-                              class=${this._keyError ? 'error' : ''}
-                          />
-                      </div>
+                      ${this._azureSessionMode === 'live'
+                          ? html`
+                                <div class="form-group">
+                                    <label class="form-label">Live Audio Model</label>
+                                    <select .value=${this._azureLiveModelChoice} @change=${e => this._saveAzureLiveModelChoice(e.target.value)}>
+                                        <option value="gpt-realtime-1.5" ?selected=${this._azureLiveModelChoice === 'gpt-realtime-1.5'}>
+                                            GPT Realtime 1.5
+                                        </option>
+                                        <option value="gpt-realtime" ?selected=${this._azureLiveModelChoice === 'gpt-realtime'}>GPT Realtime</option>
+                                        <option value="gpt-realtime-mini" ?selected=${this._azureLiveModelChoice === 'gpt-realtime-mini'}>
+                                            GPT Realtime mini
+                                        </option>
+                                    </select>
+                                </div>
 
-                      <details class="form-group" ?open=${Boolean(this._azureRealtimeDeployment.trim())}>
-                          <summary class="form-label">Advanced</summary>
-                          <input
-                              type="text"
-                              placeholder="Realtime deployment name"
-                              .value=${this._azureRealtimeDeployment}
-                              @input=${e => this._saveAzureRealtimeDeployment(e.target.value)}
-                              class=${this._keyError ? 'error' : ''}
-                          />
-                      </details>
+                                <div class="form-group">
+                                    <label class="form-label">Screenshot/Text Model</label>
+                                    <select .value=${this._azureModelChoice} @change=${e => this._saveAzureModelChoice(e.target.value)}>
+                                        <option value="gpt-4.1-nano" ?selected=${this._azureModelChoice === 'gpt-4.1-nano'}>GPT-4.1 nano</option>
+                                        <option value="gpt-4.1-mini" ?selected=${this._azureModelChoice === 'gpt-4.1-mini'}>GPT-4.1 mini</option>
+                                        <option value="gpt-5.1" ?selected=${this._azureModelChoice === 'gpt-5.1'}>GPT-5.1</option>
+                                    </select>
+                                </div>
+                            `
+                          : html`
+                                <div class="form-group">
+                                    <label class="form-label">Answer Model</label>
+                                    <select .value=${this._azureModelChoice} @change=${e => this._saveAzureModelChoice(e.target.value)}>
+                                        <option value="gpt-4.1-nano" ?selected=${this._azureModelChoice === 'gpt-4.1-nano'}>GPT-4.1 nano</option>
+                                        <option value="gpt-4.1-mini" ?selected=${this._azureModelChoice === 'gpt-4.1-mini'}>GPT-4.1 mini</option>
+                                        <option value="gpt-5.1" ?selected=${this._azureModelChoice === 'gpt-5.1'}>GPT-5.1</option>
+                                    </select>
+                                </div>
+                            `}
                   `
                 : html`
                       <div class="form-group">

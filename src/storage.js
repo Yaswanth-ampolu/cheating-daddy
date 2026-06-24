@@ -34,6 +34,8 @@ const DEFAULT_PREFERENCES = {
     ollamaModel: 'llama3.1',
     whisperModel: 'Xenova/whisper-small',
     azureResourceOrEndpoint: '',
+    azureSessionMode: 'live',
+    azureLiveModelChoice: 'gpt-realtime-1.5',
     azureModelChoice: 'gpt-4.1-mini',
     azureTranscriptionDeployment: 'gpt-4o-transcribe-diarize',
     azureRealtimeDeployment: '',
